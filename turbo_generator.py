@@ -1,62 +1,86 @@
 # coding=utf-8
 
 import re
+import fnmatch
 
-from selenium.webdriver import Chrome
+from urllib.request import urlopen
 
-driver = None
-exclude_urls = ["new=1", "new=45", "new=40", "new=69"]
+exclude_pat = {"*/geologiya-uchastka*", "*/calculato*", "*/order*", "*/notes/*", "*.ru", "*.ru/", "*#welcome"}
+exceptions = {"*/geologiya-uchastka*"}
+ACCORDION_AFTER = 0
 
 
 def site_map(sub_url, url_range=None):
-    driver.get("https://www.mosk-stroy.ru/sitemap.xml")
-    text = driver.page_source
-    url_list = re.findall("<loc>(.*)</loc>", text)
+
+    xml = urlopen("https://www.mosk-stroy.ru/sitemap.xml").read()
+
+    url_list = re.findall("<loc>(.*)</loc>", xml.decode())
     if url_range:
         include = [sub_url + str(num) for num in range(url_range[0], url_range[1])]
         url_list = [url for url in url_list for inc in include if url.endswith(inc)]
     else:
-        url_list = [url for url in url_list if url.endswith(sub_url)]
+        url_list = [url for url in url_list if sub_url in url]
 
-    for url in url_list:
-        for excl in exclude_urls:
-            if url.endswith(excl):
-                url_list.remove(url)
+    exclude_urls = set()
+    for excl in exclude_pat:
+        exclude_urls.update(fnmatch.filter(url_list, excl))
 
-    url_list = sorted(url_list)
-    return url_list
+    url_list = set(url_list) - exclude_urls
+    # for url in url_list:
+    #     for excl in exclude_urls:
+    #         if url.endswith(excl):
+    #             url_list.remove(url)
+
+    # url_list = sorted(url_list)
+    return list(url_list)
 
 
 def parse_page(page_url):
-    start_title_tag = '<h1>'
-    stop_title_tag = '</h1>'
-    stop_tag = '<div id="mc-container">'
-    stop_tag_2 = '<tr class="footer">'
-    driver.get(page_url)
-    text = driver.page_source
-    h1 = text[text.find(start_title_tag)+len(start_title_tag):text.find(stop_title_tag)]
-    if stop_tag in text:
-        text = text[text.find(stop_title_tag)+len(stop_title_tag):text.find(stop_tag)]
-    elif stop_tag_2 in text:
-        text = text[text.find(stop_title_tag)+len(stop_title_tag):text.find(stop_tag_2)]
-    # print(text)
-    return h1, text
+
+    start_tags = ['serv-content', 'news-list']
+    stop_tag = ['</section>', '<!-- Serv-form starts -->']
+
+    text = urlopen(page_url).read().decode()
+    h1 = re.findall("<h1.*>(.*)</h1>", text.replace("\n", ""))[0].strip()
+
+    block = ""
+    # Delete first H2 tag
+    text_block = text[text.find("</h2>")+5:].strip()
+    for start_tag in start_tags:
+        if start_tag in text_block:
+            text_block = text_block[text_block.find(start_tag) + 1:]
+            text_block = text_block[text_block.find(">") + 1:].strip()
+            block = text_block[:text_block.find(stop_tag[0])]
+            text_block = text_block[text_block.find(stop_tag[0])+len(stop_tag[0]):]
+        if start_tag in text_block:
+            text_block = text_block[text_block.find(start_tag) + 1:]
+            text_block = text_block[text_block.find(">") + 1:].strip()
+            block = block + text_block[:text_block.find(stop_tag[1])]
+    # lookup image by ITS class name!
+    image = "".join(re.findall("<img.*src=(.+)alt.*inner-new__img.*>", text.replace("\n", ""))).strip().replace('"', "")
+    image = image or "".join(re.findall("<img.*src=(.+)alt.*all-serv__img.*>", text.replace("\n", ""))).strip().replace('"', "")
+    wrapped_image = f'''        
+        <figure>
+          <img src="{image}">
+        </figure>
+        ''' if image else image
+
+    return h1, block, wrapped_image
 
 
-def create_turbo_page(url, h1, page_source):
-    for i in range(5):
-        if "<" in h1 and ">" in h1:
-            h1 = (h1[:h1.find("<")] + h1[h1.find(">") + 1:])
-    h1 = h1.replace("<", "").replace(">", "").replace("\n", " ").strip().strip("/").strip(".")
+def create_turbo_page(url, h1, page_source, image):
+    # for i in range(5):
+    #     if "<" in h1 and ">" in h1:
+    #         h1 = (h1[:h1.find("<")] + h1[h1.find(">") + 1:])
+    # h1 = h1.replace("<", "").replace(">", "").replace("\n", " ").strip().strip("/").strip(".")
 
     page_source = page_source.replace("\n", "").replace("<ul>•", "<br>•")
 
     # If text is too long - hide the long part under an accordion
-    if len(page_source) > 4000:
-        cut_from = 2000
-        page_source = page_source[:page_source[:cut_from].rfind(" ")] + \
+    if ACCORDION_AFTER > 0 and len(page_source) > ACCORDION_AFTER * 2:
+        page_source = page_source[:page_source[:ACCORDION_AFTER].rfind(" ")] + \
                       ' ..\n          <div data-block="accordion"> <div data-block="item" data-title="Читать далее">' + \
-                      page_source[page_source[:cut_from].rfind(" ")+1:] + "</div></div>"
+                      page_source[page_source[:ACCORDION_AFTER].rfind(" ")+1:] + "</div></div>"
 
     content = """
 
@@ -67,7 +91,7 @@ def create_turbo_page(url, h1, page_source):
       <link>%s</link>
       <turbo:content>
         <![CDATA[
-          <header><h1>%s</h1></header>
+          <header><h1>%s</h1>%s</header>
           %s
           <button formaction="tel:+7(495)724-20-30" data-background-color="#5B97B0" data-color="white" data-primary="true">Позвонить</button>
         ]]>
@@ -78,8 +102,24 @@ def create_turbo_page(url, h1, page_source):
         h1,
         url,
         h1,
+        image,
         page_source)
     return content
+
+
+def create_turbo_pages(few_url):
+    turbo_pages = []
+    for url in few_url:
+        h1, page_source, img = parse_page(url)
+        if not page_source:
+            raise Exception("NO DATA ON THE PAGE %s" % url)
+        else:
+            print(h1)
+            print(page_source)
+
+        turbo_page = create_turbo_page(url, h1, page_source, img)
+        turbo_pages.append(turbo_page)
+    return turbo_pages
 
 
 def wrap_turbo_pages(pages):
@@ -99,17 +139,12 @@ def wrap_turbo_pages(pages):
 
 
 if __name__ == '__main__':
-    driver = Chrome()
-    urls = site_map("page=", (0, 10))
-    filename = "turbo_html.rss"
 
-    turbo_pages = []
-    for url in urls:
-        h1, page_source = parse_page(url)
-        turbo_page = create_turbo_page(url, h1, page_source)
-        turbo_pages.append(turbo_page)
+    urls = site_map("/uslugi/")
+    filename = "turbo_uslugi_%s.rss"
 
-    driver.quit()
+    for i in range(0, len(urls), 50):
+        turbo_pages = create_turbo_pages(urls[i:i+50])
 
-    rss_file_content = wrap_turbo_pages(turbo_pages)
-    open(filename, "w").writelines(rss_file_content)
+        rss_file_content = wrap_turbo_pages(turbo_pages)
+        open(filename % i, "w").writelines(rss_file_content)
